@@ -51,55 +51,52 @@ user_product_matrix[user_product_matrix > 0] = 1
 user_similarity_model = NearestNeighbors(metric='euclidean')
 user_similarity_model.fit(user_product_matrix)
 
-# التوصية بناءً على التعاون
-def recommend_collaborative(user_id, user_product_matrix, user_similarity_model, k=5):
-    if user_id not in user_product_matrix.index:
-        return pd.DataFrame()  # لا يوجد بيانات كافية للمستخدم
-
-    distances, indices = user_similarity_model.kneighbors(
-        [user_product_matrix.loc[user_id].values],
-        n_neighbors=k + 1
-    )
-    similar_users = indices.flatten()[1:]
-    recommended_products = user_product_matrix.iloc[similar_users].sum().sort_values(ascending=False)
-
-    # استبعاد المنتجات التي اشتراها المستخدم بالفعل
-    user_products = user_product_matrix.loc[user_id]
-    recommended_products = recommended_products[user_products == 0]
-
-    top_products_ids = recommended_products.head(k).index.tolist()
-
-    # إرجاع جدول يحتوي معلومات المنتجات
-    return products[products['product_id'].isin(top_products_ids)][['name', 'price', 'description']]
-
-# التوصية بناءً على المحتوى
-def recommend_content_based(product_id, product_similarity_model, tfidf_matrix, products, k=5):
-    product_index = products[products['product_id'] == product_id].index[0]
-    product_vector = tfidf_matrix[product_index].toarray()
-    distances, indices = product_similarity_model.kneighbors(product_vector, n_neighbors=k + 1)
-    similar_products = indices.flatten()[1:]
-    distances = distances.flatten()[1:]
-
-    recommendations_df = products.iloc[similar_products][['name', 'price', 'description']].copy()
-    recommendations_df['score'] = 1 - distances / distances.max()  # عكس المسافة لمقياس تشابه (0 إلى 1)
-
-    return recommendations_df
-
-# دالة لتلوين الصفوف حسب قوة التوصية
+# دالة تلوين الصفوف باللون الأخضر حسب قوة التوصية
 def highlight_recommendation(row):
     if row['score'] > 0.5:
-        styles = [''] * len(row)
-        name_col_idx = row.index.get_loc('name')
-        price_col_idx = row.index.get_loc('price')
-        score_col_idx = row.index.get_loc('score')
-        styles[name_col_idx] = 'background-color: #d0f0c0'  # أخضر فاتح
-        styles[price_col_idx] = 'background-color: #d0f0c0'
-        styles[score_col_idx] = 'background-color: #d0f0c0'
-        return styles
+        return ['background-color: #d0f0c0'] * len(row)
     else:
         return [''] * len(row)
 
+# التوصية بناءً على التعاون
+def recommend_collaborative(user_id, user_product_matrix, model, top_n=5):
+    if user_id not in user_product_matrix.index:
+        return pd.DataFrame()
+
+    available_neighbors = min(top_n + 1, len(user_product_matrix))
+    distances, indices = model.kneighbors(
+        [user_product_matrix.loc[user_id].values],
+        n_neighbors=available_neighbors
+    )
+    similar_users = indices.flatten()
+    similar_users = similar_users[similar_users != user_product_matrix.index.get_loc(user_id)]
+
+    user_products = user_product_matrix.loc[user_id]
+    recommended_scores = user_product_matrix.iloc[similar_users].sum()
+    recommended_scores = recommended_scores[user_products == 0]
+    recommended_scores = recommended_scores.sort_values(ascending=False).head(top_n)
+
+    if recommended_scores.empty:
+        return pd.DataFrame()
+
+    df = products[products['product_id'].isin(recommended_scores.index)][['product_id', 'name', 'price', 'description']].copy()
+    df['score'] = df['product_id'].map(recommended_scores)
+    return df
+
+# التوصية بناءً على المحتوى
+def recommend_content_based(product_id, top_n=5):
+    product_index = products[products['product_id'] == product_id].index[0]
+    available_neighbors = min(top_n + 1, len(products))
+    product_vector = tfidf_matrix[product_index].toarray()
+    distances, indices = product_similarity_model.kneighbors(product_vector, n_neighbors=available_neighbors)
+    similar_products = indices.flatten()[1:]
+    scores = 1 - (distances.flatten()[1:] / max(distances.flatten()[1:]))
+    df = products.iloc[similar_products][['product_id', 'name', 'price', 'description']].copy()
+    df['score'] = scores
+    return df
+
 # ========== واجهة المستخدم ==========
+
 st.set_page_config(page_title="نظام التوصية", layout="centered")
 st.title("📦 نظام التوصية بالمنتجات")
 
@@ -109,32 +106,29 @@ user_map = {f"{row['name']} (ID: {row['user_id']})": row['user_id'] for _, row i
 selected_user_label = st.selectbox("👤 اختر مستخدمًا:", list(user_map.keys()))
 selected_user_id = user_map[selected_user_label]
 
+# اختيار عدد الجيران K
+k_value = st.slider("🔢 عدد الجيران المستخدمين في التوصية (K):", min_value=1, max_value=20, value=5)
+
 # اختيار نوع التوصية
 rec_type = st.radio("📊 نوع التوصية:", ["بناءً على التعاون بين المستخدمين", "بناءً على المحتوى (منتج مشابه)"])
 
-# اختيار قيمة k
-k = st.slider("🔢 اختر عدد التوصيات (k):", min_value=1, max_value=20, value=5)
-
-# عرض التوصيات
 if rec_type == "بناءً على التعاون بين المستخدمين":
     st.markdown("""
     🧠 **طريقة التوصية:**
     يتم تحديد المستخدمين المتشابهين بناءً على سجل الشراء، 
     ثم يتم اقتراح المنتجات التي اشتراها هؤلاء المستخدمون ولم يشترها المستخدم الحالي.
     """)
-    recommendations_df = recommend_collaborative(selected_user_id, user_product_matrix, user_similarity_model, k=k)
+    recommendations_df = recommend_collaborative(selected_user_id, user_product_matrix, user_similarity_model, top_n=k_value)
     if recommendations_df.empty:
         st.warning("❗️ لا توجد توصيات كافية لهذا المستخدم.")
     else:
         st.subheader("📌 المنتجات المقترحة:")
-        st.dataframe(recommendations_df.rename(columns={
-            "name": "اسم المنتج", "price": "السعر", "description": "الوصف"
-        }), use_container_width=True)
+        st.dataframe(recommendations_df.style.apply(highlight_recommendation, axis=1), use_container_width=True)
 
 else:
     user_products = purchase_df[purchase_df['user_id'] == selected_user_id]['product_id'].unique()
     if len(user_products) == 0:
-        st.warning("❗️لا يوجد منتجات قام هذا المستخدم بشرائها ليتم اعتمادها للتوصية بالمحتوى.")
+        st.warning("❗️ لا يوجد منتجات قام هذا المستخدم بشرائها ليتم اعتمادها للتوصية بالمحتوى.")
     else:
         product_names = {products.loc[products['product_id'] == pid, 'name'].values[0]: pid for pid in user_products}
         selected_product_name = st.selectbox("📘 اختر منتجًا تم شراؤه ليتم التوصية بمنتجات مشابهة:", list(product_names.keys()))
@@ -144,12 +138,6 @@ else:
         🧠 **طريقة التوصية:**
         يتم تحليل وصف المنتج المحدد باستخدام TF-IDF، ثم اقتراح منتجات مشابهة له في الوصف.
         """)
-        recommendations_df = recommend_content_based(selected_product_id, product_similarity_model, tfidf_matrix, products, k=k)
+        recommendations_df = recommend_content_based(selected_product_id, top_n=k_value)
         st.subheader("📌 المنتجات المشابهة:")
-
-        # عرض بدون عمود الوصف (لتحسين التلوين)
-        st.dataframe(
-            recommendations_df.drop(columns=['description'])
-            .style.apply(highlight_recommendation, axis=1),
-            use_container_width=True
-        )
+        st.dataframe(recommendations_df.style.apply(highlight_recommendation, axis=1), use_container_width=True)
